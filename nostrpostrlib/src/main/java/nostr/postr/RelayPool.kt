@@ -11,19 +11,6 @@ object RelayPool: Relay.Listener {
     private val eventIds = HashSet<String>()
 
 
-    fun loadRelays(relayList: List<Relay>? = null){
-        if (!relayList.isNullOrEmpty()){
-            relayList.forEach { addRelay(it) }
-        } else {
-            Constants.defaultRelays.forEach { addRelay(it) }
-        }
-    }
-
-    fun requestAndWatch(subscriptionId: String) {
-        relays.forEach { it.requestAndWatch(subscriptionId = subscriptionId) }
-
-    }
-
     fun send(signedEvent: Event) {
         relays.forEach { it.send(signedEvent) }
     }

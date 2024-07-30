@@ -16,10 +16,8 @@ import nostr.relay.Events.pubKey
 import nostr.relay.Events.raw
 import org.jetbrains.exposed.exceptions.ExposedSQLException
 import org.jetbrains.exposed.sql.*
-import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.security.InvalidParameterException
-import java.sql.Connection
 import java.util.*
 
 val gson: Gson = GsonBuilder().create()
@@ -28,7 +26,7 @@ val gson: Gson = GsonBuilder().create()
  * Per socket there can be multiple channels with multiple filters each.
  */
 val subscribers: MutableMap<WsContext, MutableMap<String, List<Filter>>> = Collections.synchronizedMap(LinkedHashMap())
-val featureList = mapOf(
+/*val featureList = mapOf(
     "id" to "wss://relay.nostr.info",
     "name" to "NostrPostrRelay",
     "description" to "Relay running NostrPostr by https://nostr.info",
@@ -36,7 +34,7 @@ val featureList = mapOf(
     "supported_nips" to listOf(1, 2, 9, 11, 12, 15, 16, 33),
     "software" to "https://github.com/Giszmo/NostrPostr",
     "version" to "1"
-)
+)*/
 
 var eventTiming = 0 to 0
 var channelCloseCounter = 0
@@ -45,37 +43,20 @@ var eventReceived = 0
 
 class NostrRelay
 
-val config: Map<String, String> = NostrRelay::class.java.getResource("/config/local.config.json")
+val config: Map<String, String> = NostrRelay::class.java.getResource("/config/postgresql.config.json")
     ?.readText()
     ?.run {
         gson.fromJson(this, object: TypeToken<Map<String, String>>() {}.type)
     }
-    ?: mapOf( // default configuration
-        "db" to "sqlite",
-        "url" to "jdbc:sqlite:events.db",
-        "driver" to "org.sqlite.JDBC",
-        "fullSync" to "false"
-    )
+    ?: throw IllegalArgumentException("Configuration file not found")
 
 fun main() {
     val rt = Runtime.getRuntime()
-    when (config["db"]) {
-        "postgresql" -> {
-            Database.connect(
-                url = config["pg_url"]!!,
-                driver = config["pg_driver"]!!,
-                user = config["pg_user"]!!,
-                password = config["pg_password"]!!)
-        }
-        else -> {
-            Database.connect(
-                url = config["lite_url"]!!,
-                driver = config["lite_driver"]!!,
-            )
-            TransactionManager.manager.defaultIsolationLevel = Connection.TRANSACTION_SERIALIZABLE
-            // or Connection.TRANSACTION_READ_UNCOMMITTED
-        }
-    }
+
+    Database.connect(
+        url = config["pg_url"]!!,
+        driver = config["pg_driver"]!!,
+        user = config["pg_user"]!!)
 
     transaction {
         addLogger(StdOutSqlLogger)
@@ -96,7 +77,7 @@ fun main() {
     }.apply {
         get("/") {
             if (it.header("Accept") == "application/nostr+json") {
-                it.json(featureList)
+                //it.json(featureList)
             } else {
                 it.redirect("/test/")
             }
@@ -123,7 +104,7 @@ fun main() {
                         "REQ" -> onRequest(jsonArray, ctx)
                         "EVENT" -> onEvent(jsonArray, ctx)
                         "CLOSE" -> onClose(jsonArray, ctx)
-                        "RID" -> ctx.send("""["RID",${gson.toJson(featureList)}]""")
+                        //"RID" -> ctx.send("""["RID",${gson.toJson(featureList)}]""")
                         else -> onUnknown(ctx, cmd, msg)
                     }
                 } catch (e: JsonSyntaxException) {
@@ -152,8 +133,6 @@ fun main() {
         // to cover even extended down-times automatically
         JsonFilter(since = Calendar.getInstance().apply { add(Calendar.HOUR, -6) }.time.time / 1000)
     }
-    Client.connect()
-    Client.requestAndWatch(filters = mutableListOf(filter))
     while (true) {
         subscribers.forEach {it.key.sendPing()}
         val queries = subscribers
