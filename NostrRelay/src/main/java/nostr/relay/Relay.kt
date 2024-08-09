@@ -19,6 +19,11 @@ import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.security.InvalidParameterException
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.concurrent.schedule
+import java.net.HttpURLConnection
+import java.net.URL
+
 
 val gson: Gson = GsonBuilder().create()
 
@@ -26,15 +31,9 @@ val gson: Gson = GsonBuilder().create()
  * Per socket there can be multiple channels with multiple filters each.
  */
 val subscribers: MutableMap<WsContext, MutableMap<String, List<Filter>>> = Collections.synchronizedMap(LinkedHashMap())
-/*val featureList = mapOf(
-    "id" to "wss://relay.nostr.info",
-    "name" to "NostrPostrRelay",
-    "description" to "Relay running NostrPostr by https://nostr.info",
-    "pubkey" to "46fcbe3065eaf1ae7811465924e48923363ff3f526bd6f73d7c184b16bd8ce4d",
-    "supported_nips" to listOf(1, 2, 9, 11, 12, 15, 16, 33),
-    "software" to "https://github.com/Giszmo/NostrPostr",
-    "version" to "1"
-)*/
+val authentificatedUsers: MutableSet<WsContext> = HashSet()
+val challengeMap = ConcurrentHashMap<WsContext, String>()
+const val challengeValidityDuration: Long = 5 * 60 * 1000
 
 var eventTiming = 0 to 0
 var channelCloseCounter = 0
@@ -85,6 +84,8 @@ fun main() {
         ws("/") { ws ->
             ws.onConnect { ctx ->
                 subscribers[ctx] = subscribers[ctx] ?: Collections.synchronizedMap(LinkedHashMap())
+                val challenge = generateChallenge(ctx)
+                ctx.send("""["AUTH", "$challenge"]""")
             }
             ws.onClose { ctx ->
                 sessionCloseCounter++
@@ -101,6 +102,7 @@ fun main() {
                 try {
                     val jsonArray = gson.fromJson(msg, JsonArray::class.java)
                     when (val cmd = jsonArray[0].asString ?: "") {
+                        "AUTH" -> onAuthentification(jsonArray, ctx)
                         "REQ" -> onRequest(jsonArray, ctx)
                         "EVENT" -> onEvent(jsonArray, ctx)
                         "CLOSE" -> onClose(jsonArray, ctx)
@@ -166,6 +168,22 @@ fun main() {
     }
 }
 
+private fun generateChallenge(ctx : WsContext): String {
+    val challenge = UUID.randomUUID().toString()
+    challengeMap[ctx] = challenge
+    Timer().schedule(challengeValidityDuration) {
+        challengeMap.remove(ctx)
+    }
+    return challenge
+}
+
+private fun validateChallenge(ctx: WsContext, providedChallenge: String): Boolean {
+    val storedChallenge = challengeMap[ctx]
+
+    return storedChallenge != null && storedChallenge == providedChallenge
+}
+
+
 private fun onUnknown(ctx: WsMessageContext, cmd: String, msg: String) {
     println("""Received unknown command "$cmd": $msg""")
     ctx.send("""["NOTICE","Could not handle command "$cmd""]""")
@@ -173,7 +191,7 @@ private fun onUnknown(ctx: WsMessageContext, cmd: String, msg: String) {
 
 private fun onClose(
     jsonArray: JsonArray,
-    ctx: WsMessageContext
+    ctx: WsContext
 ) {
     val channel = jsonArray[1].asString
     subscribers[ctx]!!.remove(channel)
@@ -184,14 +202,20 @@ private fun onEvent(
     jsonArray: JsonArray,
     ctx: WsMessageContext
 ) {
-    try {
-        val eventJson = jsonArray[1].asJsonObject
-        val event = Event.fromJson(eventJson)
-        eventReceived++
-        processEvent(event, event.toJson(), ctx)
-    } catch (e: Exception) {
-        println("Something went wrong with Event: ${gson.toJson(jsonArray[1])}")
-        e.printStackTrace()
+    val idNote = jsonArray[2].asJsonObject.get("id").asString
+    if (authentificatedUsers.contains(ctx)) {
+        try {
+            val eventJson = jsonArray[1].asJsonObject
+            val event = Event.fromJson(eventJson)
+            eventReceived++
+            processEvent(event, event.toJson(), ctx)
+        } catch (e: Exception) {
+            println("Something went wrong with Event: ${gson.toJson(jsonArray[1])}")
+            e.printStackTrace()
+        }
+    }
+    else{
+        ctx.send("""["CLOSED", "$idNote", false, "auth-required: we only accept request from registered users"]""")
     }
 }
 
@@ -200,23 +224,57 @@ private fun onRequest(
     ctx: WsMessageContext
 ) {
     val channel = jsonArray[1].asString
-    val filters = jsonArray
-        .filterIndexed { index, _ -> index > 1 }
-        .mapIndexedNotNull { index, it ->
-            try {
-                JsonFilter.fromJson(it.asJsonObject)
-            } catch (e: InvalidParameterException) {
-                println("Ignoring no-match filter $it")
-                null
-            } catch (e: Exception) {
-                ctx.send("""["NOTICE","Something went wrong with filter $it on channel $channel. Ignoring."]""")
-                println("Something went wrong with filter $index. $it")
-                null // ignore just this query
+    if (authentificatedUsers.contains(ctx)) {
+        val filters = jsonArray
+            .filterIndexed { index, _ -> index > 1 }
+            .mapIndexedNotNull { index, it ->
+                try {
+                    JsonFilter.fromJson(it.asJsonObject)
+                } catch (e: InvalidParameterException) {
+                    println("Ignoring no-match filter $it")
+                    null
+                } catch (e: Exception) {
+                    ctx.send("""["NOTICE","Something went wrong with filter $it on channel $channel. Ignoring."]""")
+                    println("Something went wrong with filter $index. $it")
+                    null // ignore just this query
+                }
             }
+        subscribers[ctx]?.put(channel, Collections.synchronizedList(filters.map { it.spaceOptimized() }))
+        sendEvents(channel, filters, ctx)
+        ctx.send("""["EOSE","$channel"]""")
+    }
+    else{
+        ctx.send("""["CLOSED", "$channel", false, "auth-required: we only accept request from registered users"]""")
+    }
+}
+
+private fun onAuthentification(
+    jsonArray: JsonArray,
+    ctx: WsContext
+) {
+    if (validateChallenge(ctx, jsonArray[1].asJsonObject.get("tags").asJsonArray.get(1).asJsonArray.get(1).asString)){
+        val idNote = jsonArray[1].asJsonObject.get("id").asString
+        if (testKey(jsonArray[1].asJsonObject.get("pubkey").asString)){
+            ctx.send("""["OK","$idNote", true, ""]""")
+            authentificatedUsers.add(ctx)
         }
-    subscribers[ctx]?.put(channel, Collections.synchronizedList(filters.map { it.spaceOptimized() }))
-    sendEvents(channel, filters, ctx)
-    ctx.send("""["EOSE","$channel"]""")
+        else {
+            ctx.send("""["CLOSED", "$idNote", false, "restricted: user not authentificated"]""")
+        }
+    }
+}
+
+fun testKey(pk : String): Boolean {
+    val url = URL("http://localhost:8081/api/server/authorized-user/${pk}")
+    val connection = url.openConnection() as HttpURLConnection
+
+    connection.requestMethod = "GET" // Pour une requête GET, changez pour "POST" si nécessaire
+
+    try {
+        return connection.responseCode.equals(302);
+    } finally {
+        connection.disconnect()
+    }
 }
 
 private fun sendEvents(channel: String, filters: List<JsonFilter>, ctx: WsContext) {
